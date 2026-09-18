@@ -2,7 +2,10 @@ import torch
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 import numpy as np
 import torch.nn.functional as F
+import librosa
+import warnings
 
+warnings.filterwarnings("ignore", category=UserWarning)
 
 class TranscritorWhisper:
     def __init__(self, model_name="openai/whisper-small", device="cuda"):
@@ -85,8 +88,20 @@ class TranscritorWhisper:
 if __name__ == "__main__":
     transcritor = TranscritorWhisper()
 
-    audio_mock = np.zeros(32000) 
+    # Substitui pelo nome do teu ficheiro de teste
+    caminho_audio = "audio6.ogg" 
     
-    # Executa a transcrição
-    resultado = transcritor.transcrever_audio(audio_mock)
-    print("Saída do Componente I5:", resultado)
+    try:
+        # Carrega o áudio já forçando a amostragem exigida pelo modelo
+        audio_real, sr = librosa.load(caminho_audio, sr=16000)
+        
+        print(f"A processar o ficheiro: {caminho_audio}...")
+        resultado = transcritor.transcrever_audio(audio_real)
+        
+        print("\n--- Saída do Componente I5 ---")
+        print(f"Texto: {resultado['texto']}")
+        print(f"Confiança: {resultado['confianca']}")
+        
+    except FileNotFoundError:
+        print(f"Erro: O ficheiro '{caminho_audio}' não foi encontrado.")
+        print("Grava um ficheiro rápido e coloca-o na mesma pasta do script.")
