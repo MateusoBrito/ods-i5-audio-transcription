@@ -1,0 +1,5 @@
+silero-vad>=6.2.0
+onnxruntime>=1.20.0
+numpy>=1.26.0
+scipy>=1.14.0
+soundfile>=0.12.0
