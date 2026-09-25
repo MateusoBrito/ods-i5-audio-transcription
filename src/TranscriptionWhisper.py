@@ -20,11 +20,9 @@ class TranscritorWhisper:
             torch_dtype=torch.float16
         ).to(self.device)
         
-        # Força o modelo a gerar em português 
-        self.model.config.forced_decoder_ids = self.processor.get_decoder_prompt_ids(
-            language="portuguese", 
-            task="transcribe"
-        )
+        # Configuração padrão de idioma para português
+        self.language = "portuguese"
+        self.task = "transcribe"
 
     def transcrever_audio(self, audio_array: np.ndarray, sampling_rate: int = 16000) -> dict:
         """
@@ -37,10 +35,12 @@ class TranscritorWhisper:
             return_tensors="pt"
         ).input_features.to(self.device, dtype=torch.float16)
 
-        # Geração de texto com extração de probabilidades 
+        # Geração de texto forçando estritamente o idioma português
         with torch.no_grad():
             outputs = self.model.generate(
                 input_features,
+                language=self.language,
+                task=self.task,
                 return_dict_in_generate=True,
                 output_scores=True
             )
@@ -89,7 +89,7 @@ if __name__ == "__main__":
     transcritor = TranscritorWhisper()
 
     # Substitui pelo nome do teu ficheiro de teste
-    caminho_audio = "audio6.ogg" 
+    caminho_audio = "data/audio6.ogg" 
     
     try:
         # Carrega o áudio já forçando a amostragem exigida pelo modelo
