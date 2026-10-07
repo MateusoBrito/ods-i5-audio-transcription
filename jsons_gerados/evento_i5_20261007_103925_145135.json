@@ -1,0 +1,16 @@
+{
+  "message_type": "event",
+  "schema": "ods.varejo.transcricao",
+  "schema_version": "1.0",
+  "producer": "I5",
+  "published_at": "2026-10-07T13:39:25.144996+00:00",
+  "payload": {
+    "origem": "mic_totem_streaming",
+    "timestamp_inicio": "2026-10-07T13:39:24.489919+00:00",
+    "timestamp_fim": "2026-10-07T13:39:34.217919+00:00",
+    "texto_transcrito": "Oi gente, eu quero fazer um pedido, eu quero uma batata frita com um x-beico e uma coca-cola para entregar no bom fim.",
+    "texto_preprocessado": "oi gente , eu querer fazer um pedido , eu querer um batata fritar com um x-beico e um coca-cola para entregar em o bom fim .",
+    "confianca_geral": 0.8237,
+    "duvida_explicita": false
+  }
+}

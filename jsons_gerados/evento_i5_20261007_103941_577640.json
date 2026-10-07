@@ -1,0 +1,16 @@
+{
+  "message_type": "event",
+  "schema": "ods.varejo.transcricao",
+  "schema_version": "1.0",
+  "producer": "I5",
+  "published_at": "2026-10-07T13:39:41.577538+00:00",
+  "payload": {
+    "origem": "mic_totem_streaming",
+    "timestamp_inicio": "2026-10-07T13:39:41.415780+00:00",
+    "timestamp_fim": "2026-10-07T13:39:45.511780+00:00",
+    "texto_transcrito": "Que era um milkshake.",
+    "texto_preprocessado": "que ser um milkshake .",
+    "confianca_geral": 0.7568,
+    "duvida_explicita": false
+  }
+}

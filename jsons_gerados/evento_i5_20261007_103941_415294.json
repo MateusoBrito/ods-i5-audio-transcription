@@ -1,0 +1,16 @@
+{
+  "message_type": "event",
+  "schema": "ods.varejo.transcricao",
+  "schema_version": "1.0",
+  "producer": "I5",
+  "published_at": "2026-10-07T13:39:41.415160+00:00",
+  "payload": {
+    "origem": "mic_totem_streaming",
+    "timestamp_inicio": "2026-10-07T13:39:40.503531+00:00",
+    "timestamp_fim": "2026-10-07T13:39:51.479531+00:00",
+    "texto_transcrito": "Metaspoye. Oi, eu queria fazer um pedido... Estou pensando. Eu quero o X, o X Bacon.",
+    "texto_preprocessado": "metaspoye . oi , eu querer fazer um pedido . estar pensar . eu querer o x , o x bacon .",
+    "confianca_geral": 0.7172,
+    "duvida_explicita": false
+  }
+}

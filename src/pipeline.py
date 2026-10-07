@@ -104,6 +104,14 @@ class RealtimeSpeechPipeline:
         Consumidor executado em thread dedicada para inferência no Whisper.
         Lê batches de fala da fila e processa diretamente da memória RAM.
         """
+        import json
+        import datetime
+        import os
+
+        # Cria a pasta de saída para os JSONs oficiais
+        pasta_saida = "jsons_gerados"
+        os.makedirs(pasta_saida, exist_ok=True)
+
         while self._running or not self.batch_queue.empty():
             try:
                 item = self.batch_queue.get(timeout=0.2)
@@ -111,42 +119,49 @@ class RealtimeSpeechPipeline:
                 continue
 
             if item is None:
-                # Sinalizador de término (poison pill)
                 self.batch_queue.task_done()
                 break
 
             batch: AudioBatch = item
             inference_start = time.perf_counter()
 
-            # Transcreve o array em memória (sem I/O de disco)
-            resultado = self.transcritor.transcrever_audio(
-                batch.audio,
+            # 1. Simula o timestamp_inicio real (P5) baseado na hora atual
+            timestamp_inicio = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+            # 2. Chama a sua IA, que agora retorna o JSON oficial (String)
+            json_contrato_string = self.transcritor.transcrever_audio(
+                audio_array=batch.audio,
                 sampling_rate=batch.sample_rate,
+                origem="mic_totem_streaming",
+                timestamp_inicio=timestamp_inicio
             )
+            
             inference_time_ms = (time.perf_counter() - inference_start) * 1000
 
-            # Monta o contrato de saída alinhado ao CONTEXT.md
-            payload = {
-                "batch_index": batch.batch_index,
-                "start_time": round(batch.start_time, 3),
-                "end_time": round(batch.end_time, 3),
-                "duration": round(batch.duration, 3),
-                "texto": resultado["texto"],
-                "confianca": resultado["confianca"],
-                "inference_time_ms": round(inference_time_ms, 2),
-                "timestamp_criacao": time.time(),
-                "metadata": batch.metadata,
-            }
+            # 3. Lê o JSON de volta para extrair os dados e mostrar no terminal
+            dados_contrato = json.loads(json_contrato_string)
+            payload_interno = dados_contrato["payload"]
+            
+            texto_extraido = payload_interno["texto_transcrito"]
+            confianca_extraida = payload_interno["confianca_geral"]
 
-            self.results.append(payload)
+            self.results.append(dados_contrato)
 
+            # 4. Salva o JSON oficial na pasta jsons_gerados
+            timestamp_arquivo = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            caminho_arquivo = os.path.join(pasta_saida, f"evento_i5_{timestamp_arquivo}.json")
+            
+            with open(caminho_arquivo, "w", encoding="utf-8") as f:
+                f.write(json_contrato_string)
+
+            # 5. Mantém o log do pipeline limpo no terminal
             if self.on_transcription:
-                self.on_transcription(payload)
+                self.on_transcription(dados_contrato)
             else:
                 print(
-                    f"[{payload['start_time']:6.2f}s -> {payload['end_time']:6.2f}s] "
-                    f"(conf: {payload['confianca']:.2f} | {payload['inference_time_ms']:.0f}ms) "
-                    f"=> \"{payload['texto']}\""
+                    f"[{batch.start_time:6.2f}s -> {batch.end_time:6.2f}s] "
+                    f"(conf: {confianca_extraida:.2f} | {inference_time_ms:.0f}ms) "
+                    f"=> \"{texto_extraido}\" [Salvo em {caminho_arquivo}]"
                 )
 
             self.batch_queue.task_done()
