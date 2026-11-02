@@ -1,8 +1,6 @@
-.venv
-<<<<<<< HEAD
+.venv/
+venv/
 __pycache__/
 *.pyc
 output_batches/
-=======
-venv
->>>>>>> origin/main
+jsons_gerados/*.json

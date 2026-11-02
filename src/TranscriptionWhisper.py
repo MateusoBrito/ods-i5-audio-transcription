@@ -13,21 +13,34 @@ import datetime
 warnings.filterwarnings("ignore", category=UserWarning)
 
 class TranscritorWhisper:
-    def __init__(self, model_name="openai/whisper-small", device="cuda"):
+    def __init__(
+        self,
+        model_name: str = "openai/whisper-small",
+        device: str = "auto",
+        language: str = "portuguese",
+        task: str = "transcribe",
+        torch_dtype: str = "float16",
+    ):
         """
         Inicializa o modelo e o processador. 
         """
-        self.device = device
+        if device == "auto" or device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+
+        # Evita float16 em CPU
+        dtype = torch.float16 if (torch_dtype == "float16" and self.device == "cuda") else torch.float32
+
         self.processor = WhisperProcessor.from_pretrained(model_name)
         
         self.model = WhisperForConditionalGeneration.from_pretrained(
             model_name,
-            torch_dtype=torch.float16
+            torch_dtype=dtype
         ).to(self.device)
         
-        # Configuração padrão de idioma para português
-        self.language = "portuguese"
-        self.task = "transcribe"
+        self.language = language
+        self.task = task
 
         try:
             self.nlp = spacy.load("pt_core_news_sm", disable=["parser", "ner"])

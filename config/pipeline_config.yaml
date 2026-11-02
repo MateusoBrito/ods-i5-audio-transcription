@@ -1,0 +1,52 @@
+# =====================================================================
+# Configurações do Componente I5 (Áudio, VAD e Transcrição)
+# =====================================================================
+
+# Parâmetros de áudio e streaming (Ingestão / P5 Mock)
+audio:
+  sample_rate: 16000              # Taxa padrão exigida pelo Silero VAD e Whisper (Hz)
+  chunk_duration_ms: 100          # Tamanho dos blocos de streaming (ms)
+  simulate_realtime: false        # Se verdadeiro, insere pausas proporcionais de microfone
+
+# Conexão com o barramento Kafka (Transporte de Eventos B2 - P5)
+kafka:
+  bootstrap_servers: "34.66.235.91:9093" # Endereço do broker (Google Cloud / Local)
+  group_id: "i5-transcritor"             # Identificador exclusivo do consumidor I5
+  topic_input: "ods.p5.audio_chunk"      # Tópico de áudio contínuo emitido por P5
+  auto_offset_reset: "latest"            # "latest" para tempo real, "earliest" para replay
+  poll_timeout_s: 1.0                    # Timeout do poll em segundos
+  enable_auto_commit: true               # Confirmação automática de offsets lidos
+
+# Front-End de Áudio na CPU (Filtros e Normalização)
+preprocessor:
+  apply_noise_filter: true        # Aplica filtro passa-banda
+  enable_spectral_subtraction: false # Subtração espectral (desativada para blocos curtos)
+  lowcut_hz: 80.0                 # Remove ruído subgrave, DC offset e vento
+  highcut_hz: 7500.0              # Limite superior da fala humana
+  filter_order: 5                 # Ordem do filtro Butterworth
+
+# Voice Activity Detection (Silero VAD na CPU via ONNX)
+vad:
+  speech_threshold: 0.50          # Limiar de ativação de fala (0.0 a 1.0)
+  negative_threshold_offset: 0.15 # Histerese para encerramento de locução
+  silence_threshold_ms: 700       # Silêncio consecutivo para fechar o batch (ms)
+  pre_speech_pad_ms: 250          # Margem de áudio antes do início da fala (ms)
+  post_speech_pad_ms: 200         # Margem de áudio após término da fala (ms)
+  min_speech_duration_ms: 250     # Duração mínima para aceitar o lote (ignora estalos)
+  use_onnx: true                  # Otimização CPU com ONNX Runtime
+
+# Modelo ASR (Whisper na GPU)
+whisper:
+  model_name: "openai/whisper-small" # "tiny", "base", "small", etc.
+  language: "portuguese"          # Idioma forçado para transcrição
+  task: "transcribe"              # "transcribe" (não traduzir)
+  device: "auto"                  # "auto" (detecta CUDA/CPU), "cuda" ou "cpu"
+  torch_dtype: "float16"          # "float16" (GPU) ou "float32" (CPU)
+
+# Políticas de Publicação e Logs (Camada 4 / A7)
+output:
+  log_level: "INFO"
+  print_inference_time: true
+  min_confidence_warning: 0.50    # Alerta se confiança for menor que esse limiar
+  save_json: true                 # Salva o evento gerado em arquivo JSON
+  json_dir: "jsons_gerados"       # Diretório de destino dos JSONs de evento
