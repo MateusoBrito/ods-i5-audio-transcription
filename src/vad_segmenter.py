@@ -6,8 +6,9 @@ e fatiar fluxos contínuos de áudio em batches de fala com timestamps preservad
 
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Deque, Generator, List, Optional
+from typing import Deque, Generator, List, Optional, Union
 import numpy as np
 import torch
 from silero_vad import load_silero_vad
@@ -25,18 +26,24 @@ class AudioBatch:
     """
     batch_index: int
     audio: np.ndarray  # Array 1D float32 a 16kHz
-    start_time: float  # Timestamp de início em segundos (alinhado com a captura)
-    end_time: float    # Timestamp de término em segundos
+    start_time: float  # Timestamp relativo de início em segundos
+    end_time: float    # Timestamp relativo de término em segundos
     duration: float    # Duração total em segundos
     sample_rate: int = 16000
+    start_at: Optional[str] = None  # Timestamp absoluto ISO 8601 (derivado de captured_at de P5)
+    end_at: Optional[str] = None    # Timestamp absoluto ISO 8601
     metadata: dict = field(default_factory=dict)
 
     def __repr__(self) -> str:
-        return (
+        base = (
             f"AudioBatch(index={self.batch_index}, "
             f"start={self.start_time:.3f}s, end={self.end_time:.3f}s, "
-            f"duration={self.duration:.3f}s, samples={len(self.audio)})"
+            f"duration={self.duration:.3f}s, samples={len(self.audio)}"
         )
+        if self.start_at:
+            base += f", start_at='{self.start_at}'"
+        base += ")"
+        return base
 
 
 class VADSegmenter:
@@ -100,8 +107,41 @@ class VADSegmenter:
         self.batch_counter: int = 0
         self.base_timestamp: float = 0.0
 
+        # Ancoragem de tempo absoluto (P5 captured_at)
+        self.first_captured_at: Optional[datetime] = None
+        self.captured_at_reference_sample: int = 0
+
         # Buffer para dados que não completam múltiplos de CHUNK_SIZE
         self.leftover_samples: np.ndarray = np.empty(0, dtype=np.float32)
+
+    @staticmethod
+    def _parse_captured_at(val: Optional[Union[str, datetime, float, int]]) -> Optional[datetime]:
+        """
+        Converte timestamp captured_at (ISO 8601, datetime ou epoch) em datetime UTC com timezone.
+        """
+        if val is None:
+            return None
+        if isinstance(val, datetime):
+            if val.tzinfo is None:
+                return val.replace(tzinfo=timezone.utc)
+            return val
+        if isinstance(val, (int, float)):
+            return datetime.fromtimestamp(val, tz=timezone.utc)
+        if isinstance(val, str):
+            val_str = val.strip()
+            try:
+                clean_str = val_str.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(clean_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except ValueError:
+                try:
+                    f = float(val_str)
+                    return datetime.fromtimestamp(f, tz=timezone.utc)
+                except ValueError:
+                    return None
+        return None
 
     def reset(self, base_timestamp: float = 0.0) -> None:
         """
@@ -117,6 +157,8 @@ class VADSegmenter:
         self.batch_start_sample = 0
         self.batch_counter = 0
         self.base_timestamp = base_timestamp
+        self.first_captured_at = None
+        self.captured_at_reference_sample = 0
         self.leftover_samples = np.empty(0, dtype=np.float32)
 
     def _evaluate_chunk(self, chunk: np.ndarray) -> float:
@@ -154,6 +196,24 @@ class VADSegmenter:
         duration = len(batch_audio) / self.sample_rate
         end_time = start_time + duration
 
+        # Ancoragem do timestamp absoluto (start_at) derivado de captured_at de P5
+        start_at_str: Optional[str] = None
+        end_at_str: Optional[str] = None
+        if self.first_captured_at is not None:
+            offset_sec = (self.batch_start_sample - self.captured_at_reference_sample) / self.sample_rate
+            start_at_dt = self.first_captured_at + timedelta(seconds=offset_sec)
+            end_at_dt = start_at_dt + timedelta(seconds=duration)
+            start_at_str = start_at_dt.isoformat()
+            end_at_str = end_at_dt.isoformat()
+
+        metadata_dict = {
+            "trimmed_silence_samples": self.consecutive_silence_samples,
+            "chunks_count": len(kept_chunks),
+        }
+        if start_at_str:
+            metadata_dict["start_at"] = start_at_str
+            metadata_dict["end_at"] = end_at_str
+
         return AudioBatch(
             batch_index=self.batch_counter,
             audio=batch_audio,
@@ -161,17 +221,26 @@ class VADSegmenter:
             end_time=end_time,
             duration=duration,
             sample_rate=self.sample_rate,
-            metadata={
-                "trimmed_silence_samples": self.consecutive_silence_samples,
-                "chunks_count": len(kept_chunks),
-            },
+            start_at=start_at_str,
+            end_at=end_at_str,
+            metadata=metadata_dict,
         )
 
-    def push_audio(self, audio_chunk: np.ndarray) -> List[AudioBatch]:
+    def push_audio(
+        self,
+        audio_chunk: np.ndarray,
+        captured_at: Optional[Union[str, datetime, float, int]] = None,
+    ) -> List[AudioBatch]:
         """
         Ingere um bloco de áudio de qualquer tamanho (streaming), divide em frames de 512
         amostras e retorna batches finalizados quando o silêncio atinge o limiar.
+        Se captured_at for fornecido, ancora a base temporal de início de fala (start_at).
         """
+        parsed_captured = self._parse_captured_at(captured_at)
+        if parsed_captured is not None and self.first_captured_at is None:
+            self.first_captured_at = parsed_captured
+            self.captured_at_reference_sample = self.total_processed_samples
+
         if not isinstance(audio_chunk, np.ndarray) or audio_chunk.dtype != np.float32:
             audio_chunk = np.asarray(audio_chunk, dtype=np.float32)
 

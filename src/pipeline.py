@@ -2,16 +2,18 @@
 """
 Pipeline de Streaming e Transcrição em Tempo Real (Componente I5).
 
-Orquestra o fluxo contínuo de áudio:
+Orquestra o fluxo contínuo de áudio configurável via YAML e CLI:
 1. Ingestão de áudio em streaming (P5 Mock / Microfone) a 16.000 Hz.
 2. Pré-processamento e filtragem passa-banda (AudioPreprocessor na CPU).
 3. Detecção de atividade de voz e segmentação contínua (VADSegmenter na CPU).
 4. Fila desacoplada em memória RAM (Queue Produtor-Consumidor).
 5. Transcrição forçada em Português com timestamps preservados (Whisper na GPU).
-6. Emissão de payloads estruturados para A6/A7 (via callback ou stdout).
+6. Emissão de payloads estruturados para A6/A7 (via callback, terminal e JSON).
 """
 
 import argparse
+import datetime
+import json
 import os
 import queue
 import sys
@@ -19,7 +21,7 @@ import threading
 import time
 import warnings
 from pathlib import Path
-from typing import Callable, Generator, List, Optional
+from typing import Any, Callable, Dict, Generator, List, Optional
 
 # Suprime avisos de depreciação do Transformers/PyTorch
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
@@ -36,6 +38,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.audio_preprocessor import AudioPreprocessor
+from src.config_loader import load_pipeline_config
 from src.vad_segmenter import AudioBatch, VADSegmenter
 
 try:
@@ -51,47 +54,85 @@ class RealtimeSpeechPipeline:
 
     def __init__(
         self,
-        model_name: str = "openai/whisper-small",
-        device: Optional[str] = None,
-        sample_rate: int = 16000,
-        speech_threshold: float = 0.5,
-        silence_threshold_ms: int = 700,
-        apply_noise_filter: bool = True,
+        config: Optional[Dict[str, Any]] = None,
+        config_path: Optional[str] = None,
         on_transcription: Optional[Callable[[dict], None]] = None,
+        **overrides,
     ):
         """
-        Inicializa o pipeline com os componentes de VAD e Transcrição.
+        Inicializa o pipeline a partir de dicionário de configuração, arquivo YAML
+        ou parâmetros diretos com precedência para overrides.
         """
-        self.sample_rate = sample_rate
-        self.apply_noise_filter = apply_noise_filter
+        # Carrega configuração base
+        if config is not None:
+            self.config = config
+        else:
+            self.config = load_pipeline_config(config_path)
+
+        # Aplica overrides pontuais (ex: passados diretamente via código ou CLI)
+        if "sample_rate" in overrides and overrides["sample_rate"] is not None:
+            self.config["audio"]["sample_rate"] = overrides["sample_rate"]
+        if "speech_threshold" in overrides and overrides["speech_threshold"] is not None:
+            self.config["vad"]["speech_threshold"] = overrides["speech_threshold"]
+        if "silence_threshold_ms" in overrides and overrides["silence_threshold_ms"] is not None:
+            self.config["vad"]["silence_threshold_ms"] = overrides["silence_threshold_ms"]
+        if "apply_noise_filter" in overrides and overrides["apply_noise_filter"] is not None:
+            self.config["preprocessor"]["apply_noise_filter"] = overrides["apply_noise_filter"]
+        if "model_name" in overrides and overrides["model_name"] is not None:
+            self.config["whisper"]["model_name"] = overrides["model_name"]
+        if "device" in overrides and overrides["device"] is not None:
+            self.config["whisper"]["device"] = overrides["device"]
+        if "language" in overrides and overrides["language"] is not None:
+            self.config["whisper"]["language"] = overrides["language"]
+
         self.on_transcription = on_transcription
 
-        if device is None:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        else:
-            self.device = device
+        audio_cfg = self.config["audio"]
+        prep_cfg = self.config["preprocessor"]
+        vad_cfg = self.config["vad"]
+        whisper_cfg = self.config["whisper"]
+        output_cfg = self.config["output"]
 
-        print(f"[I5 - Pipeline] Inicializando componentes...")
-        print(f"[I5 - Pipeline] Device de inferência Whisper: {self.device}")
+        self.sample_rate = audio_cfg.get("sample_rate", 16000)
+        self.apply_noise_filter = prep_cfg.get("apply_noise_filter", True)
+
+        # Configurações de saída
+        self.save_json = output_cfg.get("save_json", True)
+        self.json_dir = output_cfg.get("json_dir", "jsons_gerados")
+        self.min_confidence_warning = output_cfg.get("min_confidence_warning", 0.50)
+
+        config_source = self.config.get("_config_file") or "Defaults embutidos"
+        print(f"[I5 - Pipeline] Configuração carregada de: {config_source}")
 
         # Front-End de Áudio (CPU)
-        # Desativa subtração espectral em streaming curto para evitar canibalização da fala
         self.preprocessor = AudioPreprocessor(
             target_sample_rate=self.sample_rate,
-            enable_spectral_subtraction=False,
-        )
-        self.segmenter = VADSegmenter(
-            sample_rate=self.sample_rate,
-            speech_threshold=speech_threshold,
-            silence_threshold_ms=silence_threshold_ms,
-            use_onnx=True,
+            lowcut=prep_cfg.get("lowcut_hz", 80.0),
+            highcut=prep_cfg.get("highcut_hz", 7500.0),
+            filter_order=prep_cfg.get("filter_order", 5),
+            enable_spectral_subtraction=prep_cfg.get("enable_spectral_subtraction", False),
         )
 
-        # Transcritor ASR (GPU)
-        self.transcritor = TranscritorWhisper(
-            model_name=model_name,
-            device=self.device,
+        # Voice Activity Detection (Silero VAD na CPU via ONNX)
+        self.segmenter = VADSegmenter(
+            sample_rate=self.sample_rate,
+            speech_threshold=vad_cfg.get("speech_threshold", 0.50),
+            silence_threshold_ms=vad_cfg.get("silence_threshold_ms", 700),
+            pre_speech_pad_ms=vad_cfg.get("pre_speech_pad_ms", 250),
+            post_speech_pad_ms=vad_cfg.get("post_speech_pad_ms", 200),
+            min_speech_duration_ms=vad_cfg.get("min_speech_duration_ms", 250),
+            use_onnx=vad_cfg.get("use_onnx", True),
         )
+
+        # Transcritor ASR (Whisper na GPU)
+        self.transcritor = TranscritorWhisper(
+            model_name=whisper_cfg.get("model_name", "openai/whisper-small"),
+            device=whisper_cfg.get("device", "auto"),
+            language=whisper_cfg.get("language", "portuguese"),
+            task=whisper_cfg.get("task", "transcribe"),
+            torch_dtype=whisper_cfg.get("torch_dtype", "float16"),
+        )
+        print(f"[I5 - Pipeline] Whisper iniciado no device: {self.transcritor.device} (modelo: {whisper_cfg.get('model_name')})")
 
         # Fila desacoplada em RAM entre VAD (CPU) e Whisper (GPU)
         self.batch_queue: queue.Queue = queue.Queue()
@@ -104,13 +145,11 @@ class RealtimeSpeechPipeline:
         Consumidor executado em thread dedicada para inferência no Whisper.
         Lê batches de fala da fila e processa diretamente da memória RAM.
         """
-        import json
-        import datetime
-        import os
-
-        # Cria a pasta de saída para os JSONs oficiais
-        pasta_saida = "jsons_gerados"
-        os.makedirs(pasta_saida, exist_ok=True)
+        if self.save_json:
+            caminho_pasta = PROJECT_ROOT / self.json_dir
+            caminho_pasta.mkdir(parents=True, exist_ok=True)
+        else:
+            caminho_pasta = None
 
         while self._running or not self.batch_queue.empty():
             try:
@@ -125,43 +164,47 @@ class RealtimeSpeechPipeline:
             batch: AudioBatch = item
             inference_start = time.perf_counter()
 
-            # 1. Simula o timestamp_inicio real (P5) baseado na hora atual
-            timestamp_inicio = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            # 1. Base temporal da transcrição ancorada no captured_at de P5
+            timestamp_inicio = batch.start_at or datetime.datetime.now(datetime.timezone.utc).isoformat()
+            origem = batch.metadata.get("origem", "ods.p5.audio_chunk")
 
-            # 2. Chama a sua IA, que agora retorna o JSON oficial (String)
+            # 2. Chama a IA que retorna o JSON oficial (String)
             json_contrato_string = self.transcritor.transcrever_audio(
                 audio_array=batch.audio,
                 sampling_rate=batch.sample_rate,
-                origem="mic_totem_streaming",
-                timestamp_inicio=timestamp_inicio
+                origem=origem,
+                timestamp_inicio=timestamp_inicio,
             )
-            
+
             inference_time_ms = (time.perf_counter() - inference_start) * 1000
 
-            # 3. Lê o JSON de volta para extrair os dados e mostrar no terminal
+            # 3. Lê o JSON de volta para extrair dados
             dados_contrato = json.loads(json_contrato_string)
             payload_interno = dados_contrato["payload"]
-            
+
             texto_extraido = payload_interno["texto_transcrito"]
             confianca_extraida = payload_interno["confianca_geral"]
 
             self.results.append(dados_contrato)
 
-            # 4. Salva o JSON oficial na pasta jsons_gerados
-            timestamp_arquivo = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            caminho_arquivo = os.path.join(pasta_saida, f"evento_i5_{timestamp_arquivo}.json")
-            
-            with open(caminho_arquivo, "w", encoding="utf-8") as f:
-                f.write(json_contrato_string)
+            # 4. Salva o JSON oficial na pasta configurada
+            caminho_arquivo_str = ""
+            if self.save_json and caminho_pasta:
+                timestamp_arquivo = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                caminho_arquivo = caminho_pasta / f"evento_i5_{timestamp_arquivo}.json"
+                with open(caminho_arquivo, "w", encoding="utf-8") as f:
+                    f.write(json_contrato_string)
+                caminho_arquivo_str = f" [Salvo em {caminho_arquivo.relative_to(PROJECT_ROOT)}]"
 
-            # 5. Mantém o log do pipeline limpo no terminal
+            # 5. Notificação via callback ou stdout
             if self.on_transcription:
                 self.on_transcription(dados_contrato)
             else:
+                alerta = " ⚠️ (baixa confiança)" if confianca_extraida < self.min_confidence_warning else ""
                 print(
                     f"[{batch.start_time:6.2f}s -> {batch.end_time:6.2f}s] "
-                    f"(conf: {confianca_extraida:.2f} | {inference_time_ms:.0f}ms) "
-                    f"=> \"{texto_extraido}\" [Salvo em {caminho_arquivo}]"
+                    f"(conf: {confianca_extraida:.2f}{alerta} | {inference_time_ms:.0f}ms) "
+                    f"=> \"{texto_extraido}\"{caminho_arquivo_str}"
                 )
 
             self.batch_queue.task_done()
@@ -188,12 +231,17 @@ class RealtimeSpeechPipeline:
         if self._consumer_thread and self._consumer_thread.is_alive():
             self._consumer_thread.join()
 
-    def process_chunk(self, audio_chunk: np.ndarray) -> None:
+    def process_chunk(
+        self,
+        audio_chunk: np.ndarray,
+        captured_at: Optional[Union[str, datetime.datetime, float, int]] = None,
+    ) -> None:
         """
-        Processa um bloco contínuo de áudio recebido em streaming.
+        Processa um bloco contínuo de áudio recebido em streaming (Kafka ou microfone).
         
         Args:
             audio_chunk: Array numpy 1D com áudio capturado (ex: a cada 32ms - 100ms).
+            captured_at: Timestamp de captura emitido pelo hardware/P5 (ISO 8601 ou epoch).
         """
         # 1. Filtro passa-banda leve na CPU
         clean_chunk = self.preprocessor.process(
@@ -201,8 +249,8 @@ class RealtimeSpeechPipeline:
             apply_noise_reduction=self.apply_noise_filter,
         )
 
-        # 2. VAD: empacota quando detecta pausa/silêncio
-        batches = self.segmenter.push_audio(clean_chunk)
+        # 2. VAD: empacota quando detecta pausa/silêncio ancorando captured_at
+        batches = self.segmenter.push_audio(clean_chunk, captured_at=captured_at)
         for batch in batches:
             self.batch_queue.put(batch)
 
@@ -265,66 +313,147 @@ def main():
         help="Caminho do arquivo de áudio para teste (default: data/audio6.ogg)",
     )
     parser.add_argument(
+        "--config",
+        type=str,
+        default="config/pipeline_config.yaml",
+        help="Caminho para o arquivo YAML de configuração (default: config/pipeline_config.yaml)",
+    )
+    parser.add_argument(
         "--model",
         type=str,
-        default="openai/whisper-small",
-        help="Modelo Whisper a ser carregado (default: openai/whisper-small)",
+        default=None,
+        help="Modelo Whisper (sobrescreve o YAML)",
     )
     parser.add_argument(
-        "--simulate-realtime",
-        action="store_true",
-        help="Simula taxa de transmissão em tempo real inserindo pausas proporcionais",
+        "--device",
+        type=str,
+        default=None,
+        help="Device de inferência: auto, cuda ou cpu (sobrescreve o YAML)",
     )
     parser.add_argument(
-        "--chunk-ms",
-        type=int,
-        default=100,
-        help="Tamanho do chunk de streaming em milissegundos (default: 100ms)",
+        "--language",
+        type=str,
+        default=None,
+        help="Idioma forçado do Whisper (sobrescreve o YAML)",
     )
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.5,
-        help="Limiar do VAD para ativação de fala (default: 0.5)",
+        default=None,
+        help="Limiar do VAD para ativação de fala (sobrescreve o YAML)",
     )
     parser.add_argument(
         "--silence-threshold-ms",
         type=int,
-        default=700,
-        help="Limiar de silêncio para encerramento de batch (default: 700ms)",
+        default=None,
+        help="Limiar de silêncio para encerramento de batch em ms (sobrescreve o YAML)",
+    )
+    parser.add_argument(
+        "--chunk-ms",
+        type=int,
+        default=None,
+        help="Tamanho do chunk de streaming em ms (sobrescreve o YAML)",
+    )
+    parser.add_argument(
+        "--simulate-realtime",
+        action="store_true",
+        default=None,
+        help="Simula taxa de transmissão em tempo real inserindo pausas proporcionais",
     )
     parser.add_argument(
         "--no-noise-filter",
         action="store_true",
-        help="Desativa filtro de ruído",
+        default=False,
+        help="Desativa filtro passa-banda de ruído",
+    )
+    parser.add_argument(
+        "--no-save-json",
+        action="store_true",
+        default=False,
+        help="Desativa a gravação de arquivos JSON de evento",
+    )
+    parser.add_argument(
+        "--kafka",
+        action="store_true",
+        help="Consome áudio em streaming diretamente do barramento Kafka (P5 - ods.p5.audio_chunk)",
     )
 
     args = parser.parse_args()
 
+    # 1. Carrega configuração do YAML
+    config = load_pipeline_config(args.config)
+
+    # 2. Aplica overrides da CLI (CLI > YAML)
+    if args.threshold is not None:
+        config["vad"]["speech_threshold"] = args.threshold
+    if args.silence_threshold_ms is not None:
+        config["vad"]["silence_threshold_ms"] = args.silence_threshold_ms
+    if args.model is not None:
+        config["whisper"]["model_name"] = args.model
+    if args.device is not None:
+        config["whisper"]["device"] = args.device
+    if args.language is not None:
+        config["whisper"]["language"] = args.language
+    if args.chunk_ms is not None:
+        config["audio"]["chunk_duration_ms"] = args.chunk_ms
+    if args.simulate_realtime:
+        config["audio"]["simulate_realtime"] = True
+    if args.no_noise_filter:
+        config["preprocessor"]["apply_noise_filter"] = False
+    if args.no_save_json:
+        config["output"]["save_json"] = False
+
+    pipeline = RealtimeSpeechPipeline(config=config)
+
+    # 3. Modo KAFKA: escuta do barramento de eventos (P5)
+    if args.kafka:
+        from src.kafka_audio_consumer import KafkaAudioConsumer
+
+        kafka_cfg = config.get("kafka", {})
+        print(f"\n=======================================================")
+        print(f"   Iniciando Pipeline I5 via KAFKA (Streaming P5)")
+        print(f"   Broker: {kafka_cfg.get('bootstrap_servers')}")
+        print(f"   Tópico: {kafka_cfg.get('topic_input')}")
+        print(f"   Group ID: {kafka_cfg.get('group_id')}")
+        print(f"   VAD Speech Threshold: {config['vad'].get('speech_threshold')}")
+        print(f"=======================================================\n")
+
+        pipeline.start()
+        consumer = KafkaAudioConsumer.from_config(config=config)
+        try:
+            consumer.listen_and_feed(pipeline)
+        finally:
+            pipeline.flush()
+            pipeline.stop()
+            print(f"\n[I5 - Pipeline] Finalizado. Total de frases/batches transcritos: {len(pipeline.results)}")
+        return
+
+    # 4. Modo Local/Arquivo
     audio_file = Path(args.audio_path)
     if not audio_file.exists():
         print(f"Erro: Arquivo '{audio_file}' não encontrado.")
         sys.exit(1)
 
+    sample_rate = config["audio"].get("sample_rate", 16000)
+    chunk_ms = config["audio"].get("chunk_duration_ms", 100)
+    simulate_realtime = config["audio"].get("simulate_realtime", False)
+
     print(f"\n=======================================================")
     print(f"   Iniciando Pipeline I5: VAD Contínuo + Whisper")
     print(f"   Arquivo: {audio_file.name}")
-    print(f"   Modo tempo real: {args.simulate_realtime}")
+    print(f"   Modo tempo real: {simulate_realtime}")
+    print(f"   VAD Speech Threshold: {config['vad'].get('speech_threshold')}")
+    print(f"   VAD Silence Threshold: {config['vad'].get('silence_threshold_ms')}ms")
     print(f"=======================================================\n")
 
-    pipeline = RealtimeSpeechPipeline(
-        model_name=args.model,
-        speech_threshold=args.threshold,
-        silence_threshold_ms=args.silence_threshold_ms,
-        apply_noise_filter=not args.no_noise_filter,
-    )
+    pipeline = RealtimeSpeechPipeline(config=config)
 
-    chunk_size = int(16000 * (args.chunk_ms / 1000.0))
+    chunk_size = int(sample_rate * (chunk_ms / 1000.0))
     stream = simulate_audio_stream(
         str(audio_file),
-        target_sample_rate=16000,
+        target_sample_rate=sample_rate,
         chunk_size_samples=chunk_size,
-        simulate_realtime=args.simulate_realtime,
+        simulate_realtime=simulate_realtime,
     )
 
     start_total = time.perf_counter()
@@ -340,4 +469,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
